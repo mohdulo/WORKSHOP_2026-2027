@@ -38,6 +38,7 @@ const { createWebhooks } = require('./modules/webhooks/service');
 const { createWebhooksRouter } = require('./modules/webhooks/routes');
 const { createDemo } = require('./demo/service');
 const { createDemoRouter } = require('./demo/routes');
+const { createDocsRouter } = require('./docs');
 
 /**
  * REGISTRE DES MODULES — les phases suivantes ajoutent leurs entrées ici, dans l'ordre de dépendance.
@@ -92,7 +93,7 @@ function cspDirectives(config) {
 }
 
 /** Préfixes servis par l'API : jamais remplacés par la page du front. */
-const API_PREFIXES = ['/v1', '/demo', '/health'];
+const API_PREFIXES = ['/v1', '/demo', '/health', '/docs', '/openapi.json', '/openapi.yaml'];
 const isApiPath = (p) => API_PREFIXES.some((pre) => p === pre || p.startsWith(`${pre}/`));
 
 /**
@@ -198,6 +199,9 @@ function createApp(options = {}) {
   }
 
   app.get('/health', (req, res) => res.json({ ok: true }));
+
+  // Documentation OpenAPI + Swagger UI (publique, hors limite de débit) : /openapi.json, /openapi.yaml, /docs.
+  app.use(createDocsRouter());
 
   const v1 = express.Router();
   v1.use(idempotency());

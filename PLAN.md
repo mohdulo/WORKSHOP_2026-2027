@@ -62,6 +62,7 @@ Chaque module : `service.js` (logique pure, reçoit `ctx`) + `routes.js` (Expres
 - **Événements** : `ctx.events.emit(type, object)` insère dans `events` (dans la même transaction SQL). La livraison webhook est séparée (phase 5). Liste des types émis centralisée dans `modules/events/types.js` (`EVENT_TYPES`) ; un test vérifie qu'elle correspond exactement aux `emit*('type', …)` du code.
 - **Sécurité des logs** : un PAN (numéro de carte), un CVC ou un `client_secret` ne doit JAMAIS apparaître dans un log, une réponse API (sauf le client_secret au propriétaire du PI) ou la base en clair. pino `redact` (`REDACT_PATHS`) + URL masquée dans pino-http (`maskUrl`, taskForLesson L5). Les événements ne transportent pas le `client_secret`. Des tests le vérifient. Phase 5 : le secret webhook (`secret`, `secret_encrypted`) est dans `REDACT_PATHS`.
 - **Listes** : `GET /v1/<ressource>?limit=10&starting_after=<id>` → `{ object: "list", data: [...], has_more }`.
+- **Documentation** : OpenAPI 3.1 écrite à la main dans `server/src/docs/openapi.yaml`, servie sur `/openapi.json`, `/openapi.yaml` et `/docs` (Swagger UI locale, compatible CSP, sans CDN). `test/docs.test.js` vérifie que la spec est valide et que routes Express et opérations documentées coïncident exactement : **toute nouvelle route doit y être documentée**.
 
 ## 4. Modules et contrats d'API
 

@@ -12,6 +12,9 @@ export default defineConfig({
       '/v1': { target, changeOrigin: false },
       '/demo': { target, changeOrigin: false },
       '/health': { target, changeOrigin: false },
+      '/docs': { target, changeOrigin: false },
+      '/openapi.json': { target, changeOrigin: false },
+      '/openapi.yaml': { target, changeOrigin: false },
     },
   },
   build: {

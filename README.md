@@ -11,8 +11,10 @@ Prérequis : Node.js ≥ 22.
 ```bash
 npm run setup     # installe racine + server + web
 npm run dev       # API http://localhost:4000 + front http://localhost:5173
-npm test          # 221 tests (vitest + supertest)
+npm test          # 229 tests (vitest + supertest)
 ```
+
+Documentation interactive de l’API (Swagger UI) : http://localhost:4000/docs — spécification OpenAPI 3.1 sur `/openapi.json` et `/openapi.yaml` (source : `server/src/docs/openapi.yaml`).
 
 Production (un seul process qui sert aussi le front) :
 
@@ -90,6 +92,7 @@ server/src/
     webhooks/         livraison signée HMAC, retries, verify.js
     testclock/        horloge de test (avance du temps simulé)
   demo/               backend marchand de démonstration
+  docs/               OpenAPI 3.1 (openapi.yaml) + Swagger UI, servies sur /docs
 web/                  React 18 + Vite
 ```
 
@@ -123,3 +126,4 @@ curl -X POST localhost:4000/v1/payment_intents -H "Authorization: Bearer $SK" \
 
 - `PLAN.md` — spécification complète et contrats d'API, avec les écarts décidés en cours de route.
 - `taskForLesson.md` — 21 leçons tirées des erreurs rencontrées, transformées en règles.
+- `server/src/docs/openapi.yaml` — spécification OpenAPI 3.1 de l’API, consultable sur `/docs` (Swagger UI) ; un test garantit qu’elle couvre exactement les routes du serveur.

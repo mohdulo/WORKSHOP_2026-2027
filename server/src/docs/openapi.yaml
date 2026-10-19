@@ -1,0 +1,3761 @@
+openapi: 3.1.0
+# Spécification écrite à la main : source de vérité de la documentation (servie sur /openapi.json et /docs).
+# test/docs.test.js vérifie qu'elle est valide et que chaque route Express y figure (et réciproquement).
+info:
+  title: PaySim API
+  version: 0.1.0
+  summary: Prestataire de paiement simulé (projet EPSI)
+  description: |
+    PaySim est un **PSP (prestataire de services de paiement) codé de A à Z** : coffre-fort carte, autorisation / capture,
+    3-D Secure, remboursements, marketplace, abonnements, webhooks signés et grand livre en partie double.
+
+    > ⚠️ Les banques et réseaux carte sont **simulés**. Aucun argent réel ne circule.
+
+    ## Authentification
+
+    `Authorization: Bearer <clé>`
+
+    - **Clé secrète** `sk_test_…` : tous les droits (serveur marchand, tableau de bord). Ne jamais l'exposer à un navigateur.
+    - **Clé publique** `pk_test_…` : tokenisation d'une carte et, avec le `client_secret` du payment intent,
+      confirmation, 3-D Secure et lecture du statut. La clé secrète est acceptée partout où la clé publique l'est.
+
+    Clés de test par défaut (bouton *Authorize*) : `sk_test_paysimDevSecretKey000000000000` et
+    `pk_test_paysimDevPublishableKey00000000`.
+
+    ## Conventions
+
+    - **Montants** : entiers en centimes, devise `eur` uniquement.
+    - **Dates** : horodatages Unix en secondes (`created`, `current_period_end`, …).
+    - **Identifiants** : préfixe + 24 caractères (`pi_`, `ch_`, `re_`, `cus_`, `pm_`, `acct_`, `tr_`, `po_`, `prod_`, `price_`,
+      `sub_`, `in_`, `evt_`, `we_`, `whd_`, `txn_`, `tds_`).
+    - **Listes** : `?limit=` (1 à 100, défaut 10) et `?starting_after=<id>` (curseur) ; réponse
+      `{ "object": "list", "data": [...], "has_more": true|false }`, du plus récent au plus ancien.
+    - **Idempotence** : en-tête `Idempotency-Key` sur tout `POST /v1/*`. Même clé + même requête → réponse rejouée à
+      l'identique avec `Idempotent-Replayed: true` ; même clé + requête différente → `409 idempotency_error`. Expiration 24 h.
+    - **Erreurs** : `{ "error": { "type", "code", "message", "param"? } }`, voir le schéma `Error`.
+    - **Limite de débit** : 300 requêtes par minute sur `/v1` et `/demo` (`429 rate_limit_error`).
+
+    ## Cartes de test
+
+    | Numéro | Résultat |
+    |---|---|
+    | 4242 4242 4242 4242 | acceptée (Visa) |
+    | 5555 5555 5555 4444 | acceptée (Mastercard) |
+    | 4000 0000 0000 3220 | 3-D Secure demandé (`requires_action`) |
+    | 4000 0000 0000 0002 | refusée `card_declined` |
+    | 4000 0000 0000 9995 | refusée `insufficient_funds` |
+    | 4000 0000 0000 0069 | refusée `expired_card` |
+    | 4000 0000 0000 0127 | `cvc_check: fail`, paiement refusé `incorrect_cvc` |
+    | 4000 0000 0000 0341 | enregistrable, tout paiement refusé (tests de relance) |
+
+    N'importe quelle date future et n'importe quel CVC conviennent. Montant > 999 999 centimes : refusé `amount_too_large`.
+  contact:
+    name: PaySim — projet EPSI
+    url: https://github.com/mohdulo/WORKSHOP_2026-2027
+
+servers:
+  - url: /
+    description: Ce serveur (même origine que la documentation)
+  - url: http://localhost:4000
+    description: Serveur local (npm start ou Docker)
+
+tags:
+  - name: Système
+    description: État du service et spécification OpenAPI. Sans clé API.
+  - name: Clients
+    description: 'Clients (`cus_`) : e-mail, nom, métadonnées et moyen de paiement par défaut pour les factures.'
+  - name: Moyens de paiement
+    description: |
+      Coffre-fort carte (`pm_`). Le numéro part **directement du navigateur vers PaySim** avec la clé publique : il est
+      chiffré AES-256-GCM, le CVC est vérifié puis jamais stocké. Marques : visa, mastercard, amex.
+  - name: Paiements
+    description: |
+      Payment intents (`pi_`), machine à états :
+      `requires_payment_method → requires_confirmation → (requires_action) → requires_capture | succeeded`, ou `canceled`.
+      Un refus ramène le payment intent à `requires_payment_method` (`last_payment_error`). Chaque autorisation crée une
+      charge (`ch_`). Les écritures du grand livre sont passées à la capture. Une autorisation non capturée expire après 7 jours.
+  - name: Remboursements
+    description: Remboursements (`re_`) totaux ou partiels d'un paiement capturé, avec restitution optionnelle de la commission plateforme.
+  - name: Marketplace
+    description: |
+      Comptes vendeurs (`acct_`), paiements partagés (`transfer_data.destination` + `application_fee_amount`),
+      transferts (`tr_`) de la plateforme vers un vendeur et payouts (`po_`, virement bancaire simulé).
+  - name: Catalogue
+    description: Produits (`prod_`) et prix (`price_`), ponctuels ou récurrents.
+  - name: Abonnements
+    description: |
+      Abonnements (`sub_`) et factures (`in_`). Sans essai, la première facture est payée immédiatement (hors session) :
+      succès → `active`, refus → `incomplete`. Relances automatiques à +1 j, +3 j, +5 j (`past_due`), puis
+      `uncollectible` et résiliation après 4 échecs. L'horloge de test fait avancer la facturation.
+  - name: Webhooks
+    description: |
+      Endpoints (`we_`) et livraisons (`whd_`). Chaque événement est envoyé en `POST` JSON signé
+      (`PaySim-Signature: t=…,v1=HMAC-SHA256`) ; nouvelles tentatives après 1 min, 5 min, 30 min, 2 h et 8 h.
+      Voir la section *Webhooks* en bas de page pour le format reçu par le marchand.
+  - name: Événements
+    description: Journal des événements (`evt_`) émis par PaySim, consultable et filtrable par type.
+  - name: Grand livre
+    description: |
+      Grand livre en partie double : chaque opération (capture, remboursement, transfert, payout) est une transaction
+      dont la somme des écritures vaut 0. Comptes `network_receivable`, `platform_balance`, `psp_revenue`, `bank_payouts`,
+      `merchant:<acct_id>`.
+  - name: Horloge de test
+    description: |
+      Avance du temps simulé : expiration des autorisations, cycle de facturation et livraison des webhooks.
+      Désactivée en production (`NODE_ENV=production` → 404).
+  - name: Démo marchand
+    description: |
+      Backend du commerçant de démonstration (« Comptoir des Pentes »), **sans clé API** : il agit avec la clé secrète
+      en interne, qui n'est jamais renvoyée. Le montant vient toujours du catalogue serveur.
+
+security:
+  - secretKey: []
+
+paths:
+  # ---------------------------------------------------------------- Système
+  /health:
+    get:
+      tags: [Système]
+      summary: État du service
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: Le serveur répond.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /openapi.json:
+    get:
+      tags: [Système]
+      summary: Spécification OpenAPI (JSON)
+      operationId: getOpenApiJson
+      security: []
+      responses:
+        '200':
+          description: Ce document, au format JSON.
+          content:
+            application/json:
+              schema:
+                type: object
+  /openapi.yaml:
+    get:
+      tags: [Système]
+      summary: Spécification OpenAPI (YAML)
+      operationId: getOpenApiYaml
+      security: []
+      responses:
+        '200':
+          description: Ce document, au format YAML (fichier source `server/src/docs/openapi.yaml`).
+          content:
+            application/yaml:
+              schema:
+                type: string
+
+  # ---------------------------------------------------------------- Clients
+  /v1/customers:
+    post:
+      tags: [Clients]
+      summary: Créer un client
+      operationId: createCustomer
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerCreate'
+            example:
+              email: alice@example.com
+              name: Alice Martin
+              metadata: { crm_id: '42' }
+      responses:
+        '200':
+          description: Client créé (événement `customer.created`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [Clients]
+      summary: Lister les clients
+      operationId: listCustomers
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/customers/{id}:
+    parameters:
+      - $ref: '#/components/parameters/customerId'
+    get:
+      tags: [Clients]
+      summary: Lire un client
+      operationId: getCustomer
+      responses:
+        '200':
+          description: Le client.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [Clients]
+      summary: Modifier un client
+      description: |
+        Modification partielle. `invoice_settings.default_payment_method` désigne le moyen de paiement (déjà rattaché au client)
+        utilisé par défaut pour les factures d'abonnement ; `null` pour le retirer.
+      operationId: updateCustomer
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerUpdate'
+            example:
+              name: Alice Martin-Dupont
+              invoice_settings: { default_payment_method: pm_CaNPHU2gQyuNSpmzIsMC9qOw }
+      responses:
+        '200':
+          description: Client mis à jour (événement `customer.updated`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/customers/{id}/payment_methods:
+    parameters:
+      - $ref: '#/components/parameters/customerId'
+    get:
+      tags: [Moyens de paiement]
+      summary: Lister les moyens de paiement d'un client
+      operationId: listCustomerPaymentMethods
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Moyens de paiement rattachés au client.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentMethodList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- Moyens de paiement
+  /v1/payment_methods:
+    post:
+      tags: [Moyens de paiement]
+      summary: Tokeniser une carte
+      description: |
+        **Clé publique** : appel fait depuis le navigateur, la carte ne transite jamais par le serveur marchand.
+        Vérifications : Luhn, 13 à 19 chiffres, marque supportée, date non expirée, CVC de 3 ou 4 chiffres.
+        Le CVC est contrôlé par le réseau simulé (`cvc_check`) puis oublié. Le numéro n'apparaît jamais dans une réponse
+        d'erreur ni dans les logs.
+      operationId: createPaymentMethod
+      security:
+        - publishableKey: []
+        - secretKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentMethodCreate'
+            example:
+              card: { number: '4242424242424242', exp_month: 12, exp_year: 2030, cvc: '123' }
+      responses:
+        '200':
+          description: Moyen de paiement créé, non rattaché (événement `payment_method.created`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentMethod'
+        '400':
+          description: Carte invalide (`card_invalid`, `card_expired`, `card_brand_unsupported`, `parameter_invalid`…).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/payment_methods/{id}:
+    parameters:
+      - $ref: '#/components/parameters/paymentMethodId'
+    get:
+      tags: [Moyens de paiement]
+      summary: Lire un moyen de paiement
+      operationId: getPaymentMethod
+      responses:
+        '200':
+          description: Le moyen de paiement (jamais le numéro complet).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentMethod'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/payment_methods/{id}/attach:
+    parameters:
+      - $ref: '#/components/parameters/paymentMethodId'
+    post:
+      tags: [Moyens de paiement]
+      summary: Rattacher un moyen de paiement à un client
+      description: Un moyen de paiement ne peut être rattaché qu'à un seul client (`400 payment_method_already_attached` sinon).
+      operationId: attachPaymentMethod
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentMethodAttach'
+            example:
+              customer: cus_o34T0KX2MlBFoyU3z6kgKXp2
+      responses:
+        '200':
+          description: Moyen de paiement rattaché (événement `payment_method.attached`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentMethod'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- Paiements
+  /v1/payment_intents:
+    post:
+      tags: [Paiements]
+      summary: Créer un payment intent
+      description: |
+        Avec `confirm: true` et un `payment_method`, l'autorisation est tentée immédiatement :
+        - carte acceptée → `succeeded` (capture automatique) ou `requires_capture` (`capture_method: manual`) ;
+        - 3-D Secure requis → `requires_action` avec `next_action.challenge_id`, à terminer via `POST /v1/three_ds/{challenge_id}/complete` ;
+        - carte refusée → **402 `card_error`**, le payment intent (dans `error.payment_intent`) revient à `requires_payment_method`.
+
+        Paiement partagé (marketplace) : `transfer_data.destination` (compte vendeur) et `application_fee_amount`
+        (commission plateforme, strictement inférieure au montant capturé).
+      operationId: createPaymentIntent
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentIntentCreate'
+            examples:
+              immediat:
+                summary: Paiement immédiat
+                value: { amount: 2500, currency: eur, payment_method: pm_CaNPHU2gQyuNSpmzIsMC9qOw, confirm: true, description: 'Commande #42', metadata: { order: '42' } }
+              autorisation:
+                summary: Autorisation puis capture manuelle
+                value: { amount: 4800, currency: eur, payment_method: pm_VzDhMQq7LkDayETaQwR4sexI, capture_method: manual, confirm: true }
+              marketplace:
+                summary: Paiement partagé avec un vendeur
+                value: { amount: 4800, currency: eur, payment_method: pm_jS0bpAzKbzuDiJckCCtfuxQi, confirm: true, application_fee_amount: 720, transfer_data: { destination: acct_eB2xjnH1aoaSaMEQwloapmt4 } }
+              differe:
+                summary: Création seule (confirmation plus tard, côté navigateur)
+                value: { amount: 1250, currency: eur }
+      responses:
+        '200':
+          description: Payment intent créé (et confirmé si demandé).
+          headers:
+            Idempotent-Replayed:
+              $ref: '#/components/headers/Idempotent-Replayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentIntent'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/CardDeclined' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [Paiements]
+      summary: Lister les payment intents
+      operationId: listPaymentIntents
+      parameters:
+        - name: customer
+          in: query
+          description: Ne garder que les payment intents de ce client.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentIntentList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/payment_intents/{id}:
+    parameters:
+      - $ref: '#/components/parameters/paymentIntentId'
+    get:
+      tags: [Paiements]
+      summary: Lire un payment intent
+      description: |
+        Avec la clé **publique**, `?client_secret=` est obligatoire (`400 parameter_missing`) ; un secret faux ou d'un autre
+        payment intent répond `404` (même réponse qu'un identifiant inconnu : pas d'oracle d'existence).
+      operationId: getPaymentIntent
+      security:
+        - publishableKey: []
+        - secretKey: []
+      parameters:
+        - name: client_secret
+          in: query
+          description: Secret du payment intent (`pi_…_secret_…`), requis avec une clé publique.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Le payment intent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentIntent'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/payment_intents/{id}/confirm:
+    parameters:
+      - $ref: '#/components/parameters/paymentIntentId'
+    post:
+      tags: [Paiements]
+      summary: Confirmer un payment intent
+      description: |
+        Tente l'autorisation avec `payment_method` (ou celui déjà associé). Avec la clé **publique**, le `client_secret`
+        du payment intent est obligatoire dans le corps. Issues : `succeeded`, `requires_capture`, `requires_action`
+        (3-D Secure) ou **402 `card_error`**. Statut incompatible → `409 state_error`.
+      operationId: confirmPaymentIntent
+      security:
+        - publishableKey: []
+        - secretKey: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentIntentConfirm'
+            example:
+              payment_method: pm_CaNPHU2gQyuNSpmzIsMC9qOw
+              client_secret: pi_KTCLNzEDFaN6qQa6lbKSlYO6_secret_bSMKPz_OabzaTgy20x2T_1Yc
+      responses:
+        '200':
+          description: Payment intent mis à jour.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentIntent'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/CardDeclined' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/payment_intents/{id}/capture:
+    parameters:
+      - $ref: '#/components/parameters/paymentIntentId'
+    post:
+      tags: [Paiements]
+      summary: Capturer une autorisation
+      description: |
+        Statut requis : `requires_capture`. `amount_to_capture` (défaut : tout) doit être ≤ au montant autorisé ; le reste est
+        libéré. Passe les écritures du grand livre (frais PSP `round(1,4 % × montant) + 25` centimes).
+        Événements `charge.captured`, `payment_intent.succeeded`.
+      operationId: capturePaymentIntent
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentIntentCapture'
+            example:
+              amount_to_capture: 4000
+      responses:
+        '200':
+          description: Payment intent `succeeded`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentIntent'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/payment_intents/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/paymentIntentId'
+    post:
+      tags: [Paiements]
+      summary: Annuler un payment intent
+      description: Possible tant que le paiement n'est pas `succeeded` ni déjà `canceled` (sinon `409 state_error`). Une autorisation en attente est libérée.
+      operationId: cancelPaymentIntent
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentIntentCancel'
+            example:
+              cancellation_reason: requested_by_customer
+      responses:
+        '200':
+          description: Payment intent `canceled` (événement `payment_intent.canceled`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentIntent'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/three_ds/{challenge_id}/complete:
+    post:
+      tags: [Paiements]
+      summary: Terminer un défi 3-D Secure
+      description: |
+        Simule la réponse de la banque au défi `tds_…` (`next_action.challenge_id`). `approve` reprend la confirmation
+        (`succeeded` ou `requires_capture`) ; `deny` répond **402** `payment_intent_authentication_failure`
+        (`decline_code: authentication_failed`). Avec la clé **publique**, `client_secret` est obligatoire.
+      operationId: completeThreeDs
+      security:
+        - publishableKey: []
+        - secretKey: []
+      parameters:
+        - name: challenge_id
+          in: path
+          required: true
+          description: Identifiant du défi (`tds_…`).
+          schema:
+            type: string
+          example: tds_fQyfJBheytPmV6pB1arKrz4r
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ThreeDsComplete'
+            example:
+              result: approve
+              client_secret: pi_ShQ1O5IqmNgrvlmerqbjwo2d_secret_xyhJO3Mhs9puYoblSiYEqIC1
+      responses:
+        '200':
+          description: Payment intent après authentification.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentIntent'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/CardDeclined' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/charges:
+    get:
+      tags: [Paiements]
+      summary: Lister les charges
+      description: Une charge par tentative d'autorisation (`succeeded` ou `failed`).
+      operationId: listCharges
+      parameters:
+        - name: payment_intent
+          in: query
+          description: Ne garder que les charges de ce payment intent.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChargeList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/charges/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Identifiant de la charge (`ch_…`).
+        schema:
+          type: string
+        example: ch_5GDhLjaWaek37aQAwDo9TbYY
+    get:
+      tags: [Paiements]
+      summary: Lire une charge
+      operationId: getCharge
+      responses:
+        '200':
+          description: La charge.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Charge'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- Remboursements
+  /v1/refunds:
+    post:
+      tags: [Remboursements]
+      summary: Créer un remboursement
+      description: |
+        Le payment intent doit être `succeeded` (`409 payment_intent_unexpected_state` sinon). `amount` par défaut = reste
+        remboursable ; la somme des remboursements ne peut pas dépasser le montant capturé (`400 amount_too_large`).
+        `refund_application_fee: true` (paiement partagé seulement) restitue au vendeur la part de commission correspondante.
+        Le client est toujours remboursé, même si le solde du vendeur devient négatif. Événements `refund.created`, `charge.refunded`.
+      operationId: createRefund
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefundCreate'
+            example:
+              payment_intent: pi_MR6CPNmfpuTMzysaMJBJPmHl
+              amount: 500
+              reason: requested_by_customer
+              metadata: { ticket: SAV-7 }
+      responses:
+        '200':
+          description: Remboursement effectué.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [Remboursements]
+      summary: Lister les remboursements
+      operationId: listRefunds
+      parameters:
+        - name: payment_intent
+          in: query
+          description: Ne garder que les remboursements de ce payment intent.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefundList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/refunds/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Identifiant du remboursement (`re_…`).
+        schema:
+          type: string
+        example: re_40wpvx7ZBiA77pcOLXnmMqHP
+    get:
+      tags: [Remboursements]
+      summary: Lire un remboursement
+      operationId: getRefund
+      responses:
+        '200':
+          description: Le remboursement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Refund'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- Marketplace
+  /v1/accounts:
+    post:
+      tags: [Marketplace]
+      summary: Créer un compte vendeur
+      description: Crée aussi le compte `merchant:<acct_id>` du grand livre. Événement `account.created`.
+      operationId: createAccount
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountCreate'
+            example:
+              email: atelier@example.com
+              business_name: Atelier Lyonnais
+      responses:
+        '200':
+          description: 'Compte créé (`status: enabled`).'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [Marketplace]
+      summary: Lister les comptes vendeurs
+      operationId: listAccounts
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/accounts/{id}:
+    parameters:
+      - $ref: '#/components/parameters/accountId'
+    get:
+      tags: [Marketplace]
+      summary: Lire un compte vendeur
+      operationId: getAccount
+      responses:
+        '200':
+          description: Le compte.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/accounts/{id}/balance:
+    parameters:
+      - $ref: '#/components/parameters/accountId'
+    get:
+      tags: [Marketplace]
+      summary: Solde d'un compte vendeur
+      description: Solde disponible pour un payout (ventes partagées + transferts − remboursements − payouts). Peut être négatif.
+      operationId: getAccountBalance
+      responses:
+        '200':
+          description: Solde.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Balance'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/transfers:
+    post:
+      tags: [Marketplace]
+      summary: Transférer des fonds vers un vendeur
+      description: Débite `platform_balance`, crédite `merchant:<destination>`. Solde plateforme insuffisant → `402 insufficient_balance`. Événement `transfer.created`.
+      operationId: createTransfer
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferCreate'
+            example:
+              amount: 100
+              destination: acct_eB2xjnH1aoaSaMEQwloapmt4
+              description: Bonus
+      responses:
+        '200':
+          description: Transfert effectué.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/InsufficientBalance' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [Marketplace]
+      summary: Lister les transferts
+      operationId: listTransfers
+      parameters:
+        - name: destination
+          in: query
+          description: Ne garder que les transferts vers ce compte vendeur.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/transfers/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Identifiant du transfert (`tr_…`).
+        schema:
+          type: string
+        example: tr_pCaYneT381HD0yRPEiDneEDZ
+    get:
+      tags: [Marketplace]
+      summary: Lire un transfert
+      operationId: getTransfer
+      responses:
+        '200':
+          description: Le transfert.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/payouts:
+    post:
+      tags: [Marketplace]
+      summary: Virer le solde d'un vendeur vers sa banque (payout)
+      description: 'Virement bancaire simulé, `status: paid` immédiat. Montant ≤ solde disponible du vendeur (`402 insufficient_balance` sinon). Événement `payout.paid`.'
+      operationId: createPayout
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayoutCreate'
+            example:
+              account: acct_eB2xjnH1aoaSaMEQwloapmt4
+              amount: 1000
+              description: Virement hebdo
+      responses:
+        '200':
+          description: Payout effectué.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payout'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/InsufficientBalance' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [Marketplace]
+      summary: Lister les payouts
+      operationId: listPayouts
+      parameters:
+        - name: account
+          in: query
+          description: Ne garder que les payouts de ce compte vendeur.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayoutList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/payouts/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Identifiant du payout (`po_…`).
+        schema:
+          type: string
+        example: po_azVHEVzK7VbDsnNCyLmgLgLc
+    get:
+      tags: [Marketplace]
+      summary: Lire un payout
+      operationId: getPayout
+      responses:
+        '200':
+          description: Le payout.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payout'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- Catalogue
+  /v1/products:
+    post:
+      tags: [Catalogue]
+      summary: Créer un produit
+      operationId: createProduct
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductCreate'
+            example:
+              name: Café du mois
+              description: Sélection mensuelle
+              metadata: { sku: CAFE-M }
+      responses:
+        '200':
+          description: Produit créé (événement `product.created`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [Catalogue]
+      summary: Lister les produits
+      operationId: listProducts
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/products/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Identifiant du produit (`prod_…`).
+        schema:
+          type: string
+        example: prod_yxW1icYcRuS0BCi9pjH3L7Ou
+    get:
+      tags: [Catalogue]
+      summary: Lire un produit
+      operationId: getProduct
+      responses:
+        '200':
+          description: Le produit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/prices:
+    post:
+      tags: [Catalogue]
+      summary: Créer un prix
+      description: |
+        Sans `recurring` → prix ponctuel (`type: one_time`). Avec `recurring` → prix récurrent utilisable pour un abonnement ;
+        la période (`interval` × `interval_count`) ne peut pas dépasser un an (day ≤ 365, week ≤ 52, month ≤ 12, year = 1).
+      operationId: createPrice
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PriceCreate'
+            examples:
+              mensuel:
+                summary: Abonnement mensuel 9,90 €
+                value: { product: prod_yxW1icYcRuS0BCi9pjH3L7Ou, unit_amount: 990, currency: eur, recurring: { interval: month, interval_count: 1 }, nickname: Mensuel }
+              ponctuel:
+                summary: Prix ponctuel
+                value: { product: prod_yxW1icYcRuS0BCi9pjH3L7Ou, unit_amount: 1250, currency: eur }
+      responses:
+        '200':
+          description: Prix créé (événement `price.created`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Price'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [Catalogue]
+      summary: Lister les prix
+      operationId: listPrices
+      parameters:
+        - name: product
+          in: query
+          description: Ne garder que les prix de ce produit.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PriceList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/prices/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Identifiant du prix (`price_…`).
+        schema:
+          type: string
+        example: price_7DKNpBxQf2KvtYhpsx880H45
+    get:
+      tags: [Catalogue]
+      summary: Lire un prix
+      operationId: getPrice
+      responses:
+        '200':
+          description: Le prix.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Price'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- Abonnements
+  /v1/subscriptions:
+    post:
+      tags: [Abonnements]
+      summary: Créer un abonnement
+      description: |
+        Le prix doit être récurrent (`400 price_not_recurring`). Moyen de paiement : `default_payment_method`, sinon
+        `customer.invoice_settings.default_payment_method`.
+        - avec `trial_period_days` : `trialing`, première facture à la fin de l'essai ;
+        - sinon : facture `subscription_create` payée immédiatement hors session → `active` ; refus (ou aucun moyen de
+          paiement) → `incomplete`, facture `open` à régler via `POST /v1/invoices/{id}/pay` (pas de relance automatique).
+      operationId: createSubscription
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubscriptionCreate'
+            examples:
+              immediat:
+                summary: Abonnement facturé immédiatement
+                value: { customer: cus_o34T0KX2MlBFoyU3z6kgKXp2, price: price_7DKNpBxQf2KvtYhpsx880H45, metadata: { plan: mensuel } }
+              essai:
+                summary: Avec 14 jours d'essai
+                value: { customer: cus_o34T0KX2MlBFoyU3z6kgKXp2, price: price_7DKNpBxQf2KvtYhpsx880H45, trial_period_days: 14 }
+      responses:
+        '200':
+          description: Abonnement créé (`trialing`, `active` ou `incomplete`). Événement `customer.subscription.created`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subscription'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [Abonnements]
+      summary: Lister les abonnements
+      operationId: listSubscriptions
+      parameters:
+        - name: customer
+          in: query
+          description: Ne garder que les abonnements de ce client.
+          schema:
+            type: string
+        - name: status
+          in: query
+          description: Filtrer par statut.
+          schema:
+            $ref: '#/components/schemas/SubscriptionStatus'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/subscriptions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/subscriptionId'
+    get:
+      tags: [Abonnements]
+      summary: Lire un abonnement
+      operationId: getSubscription
+      responses:
+        '200':
+          description: L'abonnement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subscription'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [Abonnements]
+      summary: Modifier un abonnement
+      description: Change le moyen de paiement par défaut (`null` pour revenir à celui du client) ou programme / annule la résiliation en fin de période. Événement `customer.subscription.updated`.
+      operationId: updateSubscription
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubscriptionUpdate'
+            example:
+              cancel_at_period_end: true
+      responses:
+        '200':
+          description: Abonnement mis à jour.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subscription'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/subscriptions/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/subscriptionId'
+    post:
+      tags: [Abonnements]
+      summary: Résilier un abonnement
+      description: |
+        Immédiat (défaut) : `canceled`, les factures `open` passent `void`. `at_period_end: true` : résiliation programmée
+        à `current_period_end` sans nouvelle facture. Déjà résilié, ou `incomplete` avec `at_period_end` → `409 state_error`.
+      operationId: cancelSubscription
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubscriptionCancel'
+            example:
+              at_period_end: false
+      responses:
+        '200':
+          description: Abonnement résilié ou programmé pour résiliation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subscription'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/invoices:
+    get:
+      tags: [Abonnements]
+      summary: Lister les factures
+      operationId: listInvoices
+      parameters:
+        - name: subscription
+          in: query
+          description: Ne garder que les factures de cet abonnement.
+          schema:
+            type: string
+        - name: customer
+          in: query
+          description: Ne garder que les factures de ce client.
+          schema:
+            type: string
+        - name: status
+          in: query
+          description: Filtrer par statut.
+          schema:
+            $ref: '#/components/schemas/InvoiceStatus'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/invoices/{id}:
+    parameters:
+      - $ref: '#/components/parameters/invoiceId'
+    get:
+      tags: [Abonnements]
+      summary: Lire une facture
+      operationId: getInvoice
+      responses:
+        '200':
+          description: La facture.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invoice'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/invoices/{id}/pay:
+    parameters:
+      - $ref: '#/components/parameters/invoiceId'
+    post:
+      tags: [Abonnements]
+      summary: Payer une facture (nouvelle tentative)
+      description: |
+        Facture `open` uniquement (`409 invoice_unexpected_state` sinon). `payment_method` facultatif (sinon celui de
+        l'abonnement ou du client). Succès → facture `paid`, abonnement `active`. Refus → l'échec est enregistré
+        (`attempt_count`, relance ou `uncollectible`) **puis** `402 card_error` avec le payment intent à jour.
+      operationId: payInvoice
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvoicePay'
+            example: {}
+      responses:
+        '200':
+          description: Facture payée (événement `invoice.paid`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invoice'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/CardDeclined' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- Webhooks
+  /v1/event_types:
+    get:
+      tags: [Webhooks]
+      summary: Types d'événements disponibles
+      description: Valeurs acceptées dans `enabled_events` (en plus de `"*"`).
+      operationId: listEventTypes
+      responses:
+        '200':
+          description: Liste complète (non paginée).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventTypeList'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/webhook_endpoints:
+    post:
+      tags: [Webhooks]
+      summary: Créer un webhook endpoint
+      description: |
+        URL `http:` ou `https:` sans identifiants (`400 url_invalid`). `enabled_events` : `["*"]` seul, ou des types de
+        `GET /v1/event_types` (`400 event_type_unknown`). **Le `secret` (`whsec_…`) n'est renvoyé qu'à la création** :
+        le conserver pour vérifier les signatures.
+      operationId: createWebhookEndpoint
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookEndpointCreate'
+            example:
+              url: https://marchand.example.com/paysim/webhook
+              enabled_events: ['payment_intent.succeeded', 'invoice.paid']
+              description: Serveur marchand
+      responses:
+        '200':
+          description: Endpoint créé, avec son secret.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEndpointWithSecret'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    get:
+      tags: [Webhooks]
+      summary: Lister les webhook endpoints
+      operationId: listWebhookEndpoints
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée (sans les secrets).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEndpointList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/webhook_endpoints/{id}:
+    parameters:
+      - $ref: '#/components/parameters/webhookEndpointId'
+    get:
+      tags: [Webhooks]
+      summary: Lire un webhook endpoint
+      operationId: getWebhookEndpoint
+      responses:
+        '200':
+          description: L'endpoint (sans le secret).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEndpoint'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    post:
+      tags: [Webhooks]
+      summary: Modifier un webhook endpoint
+      description: Un endpoint `disabled` garde ses livraisons en attente ; elles partent dès sa réactivation.
+      operationId: updateWebhookEndpoint
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookEndpointUpdate'
+            example:
+              enabled_events: ['payment_intent.succeeded', 'invoice.paid']
+              disabled: false
+      responses:
+        '200':
+          description: Endpoint mis à jour.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEndpoint'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+    delete:
+      tags: [Webhooks]
+      summary: Supprimer un webhook endpoint
+      description: Supprime aussi ses livraisons.
+      operationId: deleteWebhookEndpoint
+      responses:
+        '200':
+          description: Endpoint supprimé.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deleted'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/webhook_endpoints/{id}/deliveries:
+    parameters:
+      - $ref: '#/components/parameters/webhookEndpointId'
+    get:
+      tags: [Webhooks]
+      summary: Lister les livraisons d'un endpoint
+      operationId: listWebhookDeliveries
+      parameters:
+        - name: status
+          in: query
+          description: Filtrer par statut de livraison.
+          schema:
+            $ref: '#/components/schemas/WebhookDeliveryStatus'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookDeliveryList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- Événements
+  /v1/events:
+    get:
+      tags: [Événements]
+      summary: Lister les événements
+      operationId: listEvents
+      parameters:
+        - name: type
+          in: query
+          description: Ne garder que les événements de ce type (voir `GET /v1/event_types`).
+          schema:
+            type: string
+          example: payment_intent.succeeded
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/events/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Identifiant de l'événement (`evt_…`).
+        schema:
+          type: string
+        example: evt_dDC6wOMJTGxBHuDMRaOJ9ZeX
+    get:
+      tags: [Événements]
+      summary: Lire un événement
+      operationId: getEvent
+      responses:
+        '200':
+          description: L'événement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- Grand livre
+  /v1/balance:
+    get:
+      tags: [Grand livre]
+      summary: Solde de la plateforme
+      description: Solde du compte `platform_balance` (ventes directes + commissions − frais PSP − remboursements − transferts).
+      operationId: getBalance
+      responses:
+        '200':
+          description: Solde.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Balance'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/ledger/check:
+    get:
+      tags: [Grand livre]
+      summary: Vérifier l'équilibre du grand livre
+      description: Recalcule la somme de toutes les écritures (doit valoir 0) et liste les transactions déséquilibrées.
+      operationId: checkLedger
+      responses:
+        '200':
+          description: Résultat de la vérification.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LedgerCheck'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/ledger/accounts:
+    get:
+      tags: [Grand livre]
+      summary: Lister les comptes du grand livre
+      description: Tous les comptes avec leur solde (non paginé).
+      operationId: listLedgerAccounts
+      responses:
+        '200':
+          description: Comptes et soldes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LedgerAccountList'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/ledger/transactions:
+    get:
+      tags: [Grand livre]
+      summary: Lister les transactions du grand livre
+      operationId: listLedgerTransactions
+      parameters:
+        - name: ref_id
+          in: query
+          description: Ne garder que les transactions liées à cet objet (`pi_…`, `re_…`, `tr_…`, `po_…`).
+          schema:
+            type: string
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/starting_after'
+      responses:
+        '200':
+          description: Liste paginée, écritures incluses.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LedgerTransactionList'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- Horloge de test
+  /v1/test_clock:
+    get:
+      tags: [Horloge de test]
+      summary: Lire l'horloge de test
+      operationId: getTestClock
+      responses:
+        '200':
+          description: Instant courant du serveur (temps réel + décalage).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestClock'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: En production, la route n'existe pas (`route_not_found`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /v1/test_clock/advance:
+    post:
+      tags: [Horloge de test]
+      summary: Avancer l'horloge de test
+      description: |
+        Avance le temps simulé de `seconds` (entier > 0, ≤ 5 ans) puis exécute, dans l'ordre : expiration des autorisations
+        de plus de 7 jours, cycle de facturation (`billing`), livraison des webhooks (`hooks.webhooks`). Les webhooks sont
+        envoyés **avant** la réponse. Le décalage n'est pas persisté : un redémarrage revient au temps réel.
+      operationId: advanceTestClock
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TestClockAdvance'
+            example:
+              seconds: 2678400
+      responses:
+        '200':
+          description: Nouvel instant et résumé des traitements.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestClockAdvanceResult'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: En production, la route n'existe pas (`route_not_found`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- Démo marchand
+  /demo/config:
+    get:
+      tags: [Démo marchand]
+      summary: Catalogue et clé publique de la boutique de démo
+      operationId: getDemoConfig
+      security: []
+      responses:
+        '200':
+          description: Boutique, clé publique, produits et prix d'abonnement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DemoConfig'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /demo/checkout:
+    post:
+      tags: [Démo marchand]
+      summary: Démarrer un paiement pour un produit du catalogue
+      description: |
+        Crée le payment intent côté marchand et renvoie le `client_secret` que le navigateur utilise ensuite avec la clé
+        publique (`POST /v1/payment_intents/{id}/confirm`). Le montant vient du catalogue : tout autre champ (`amount`,
+        `currency`, …) est **refusé** (400). Produit inconnu → `400 resource_missing`.
+      operationId: demoCheckout
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DemoCheckout'
+            example:
+              productId: prod_Bibx7ISeUCFszg3y4xOvw7kn
+      responses:
+        '200':
+          description: Payment intent créé.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DemoCheckoutResult'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /demo/subscribe:
+    post:
+      tags: [Démo marchand]
+      summary: Souscrire à l'abonnement de démo
+      description: |
+        Crée le client, rattache le moyen de paiement (tokenisé au préalable avec la clé publique), le définit par défaut
+        et crée l'abonnement, dans une seule transaction. Carte refusée → abonnement `incomplete` enregistré puis
+        **402 `card_error`** avec `subscription` et `invoice`.
+      operationId: demoSubscribe
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DemoSubscribe'
+            example:
+              email: carol@example.com
+              payment_method: pm_CaNPHU2gQyuNSpmzIsMC9qOw
+      responses:
+        '200':
+          description: Abonnement actif.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DemoSubscribeResult'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '402':
+          description: Carte refusée ; l'abonnement `incomplete` et sa facture `open` existent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DemoCardError'
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+# ====================================================================== Webhooks sortants
+webhooks:
+  event:
+    post:
+      tags: [Webhooks]
+      summary: Événement livré à votre endpoint
+      description: |
+        Pour chaque événement correspondant à `enabled_events`, PaySim envoie un `POST` JSON à l'URL de l'endpoint
+        (timeout 5 s, redirections refusées). Répondre **2xx** vaut accusé de réception ; sinon nouvelles tentatives après
+        1 min, 5 min, 30 min, 2 h et 8 h, puis livraison `failed`. Livraison « au moins une fois » : dédupliquer par `id`.
+
+        **Signature** : `PaySim-Signature: t=<timestamp Unix>,v1=<hex HMAC-SHA256(secret, "<t>.<corps brut>")>`.
+        Vérifier sur les octets reçus (jamais sur un JSON re-sérialisé), avec une tolérance de 300 s sur `t`
+        (temps réel). Plusieurs `v1=` peuvent être présents. Utilitaire autonome : `server/src/modules/webhooks/verify.js`.
+      parameters:
+        - name: PaySim-Signature
+          in: header
+          required: true
+          description: Horodatage et signature(s) HMAC-SHA256 du corps brut.
+          schema:
+            type: string
+          example: t=1767225600,v1=4a7d1ed414474e4033ac29ccb8653d9b9ad9dbf64f4a5a2a37ab9c8a2f4e0c1d
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Event'
+      responses:
+        '200':
+          description: Reçu (tout code 2xx est accepté).
+
+# ====================================================================== Composants
+components:
+  securitySchemes:
+    secretKey:
+      type: http
+      scheme: bearer
+      bearerFormat: sk_test_…
+      description: 'Clé secrète (`sk_test_…`) : tous les droits. À n''utiliser que côté serveur.'
+    publishableKey:
+      type: http
+      scheme: bearer
+      bearerFormat: pk_test_…
+      description: 'Clé publique (`pk_test_…`) : tokenisation et opérations munies du `client_secret` du payment intent.'
+
+  headers:
+    Idempotent-Replayed:
+      description: Présent (valeur `true`) quand la réponse est la copie d'une requête précédente portant la même `Idempotency-Key`.
+      schema:
+        type: string
+        enum: ['true']
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Clé d'idempotence (1 à 255 caractères) propre à la clé API. Même clé + même requête → réponse rejouée
+        (`Idempotent-Replayed: true`) ; même clé + méthode, chemin ou corps différent → `409 idempotency_key_reused` ;
+        requête encore en cours → `409 idempotency_key_in_use`. Expiration 24 h.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+      example: commande-42
+    limit:
+      name: limit
+      in: query
+      description: Nombre maximal d'objets renvoyés (1 à 100, défaut 10).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 10
+    starting_after:
+      name: starting_after
+      in: query
+      description: Curseur, identifiant du dernier objet de la page précédente (`400 resource_missing` s'il n'existe pas).
+      schema:
+        type: string
+    customerId:
+      name: id
+      in: path
+      required: true
+      description: Identifiant du client (`cus_…`).
+      schema:
+        type: string
+      example: cus_o34T0KX2MlBFoyU3z6kgKXp2
+    paymentMethodId:
+      name: id
+      in: path
+      required: true
+      description: Identifiant du moyen de paiement (`pm_…`).
+      schema:
+        type: string
+      example: pm_CaNPHU2gQyuNSpmzIsMC9qOw
+    paymentIntentId:
+      name: id
+      in: path
+      required: true
+      description: Identifiant du payment intent (`pi_…`).
+      schema:
+        type: string
+      example: pi_MR6CPNmfpuTMzysaMJBJPmHl
+    accountId:
+      name: id
+      in: path
+      required: true
+      description: Identifiant du compte vendeur (`acct_…`).
+      schema:
+        type: string
+      example: acct_eB2xjnH1aoaSaMEQwloapmt4
+    subscriptionId:
+      name: id
+      in: path
+      required: true
+      description: Identifiant de l'abonnement (`sub_…`).
+      schema:
+        type: string
+      example: sub_vOmzmoPAusAZVOEAtg3OlfRC
+    invoiceId:
+      name: id
+      in: path
+      required: true
+      description: Identifiant de la facture (`in_…`).
+      schema:
+        type: string
+      example: in_mY2HgQ6DGTAmd7qapBMF3jf0
+    webhookEndpointId:
+      name: id
+      in: path
+      required: true
+      description: Identifiant du webhook endpoint (`we_…`).
+      schema:
+        type: string
+      example: we_lFzBmZ3yY3Gqp678xapqhLOw
+
+  responses:
+    BadRequest:
+      description: Requête invalide (`invalid_request_error`) — paramètre manquant ou invalide, champ inconnu, objet référencé inexistant, JSON mal formé.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            parametre:
+              summary: Paramètre invalide
+              value: { error: { type: invalid_request_error, code: parameter_invalid, message: 'email : Invalid email address', param: email } }
+            reference:
+              summary: Objet référencé inexistant
+              value: { error: { type: invalid_request_error, code: resource_missing, message: 'Aucun(e) payment_method avec l''id "pm_inconnu".', param: payment_method } }
+    Unauthorized:
+      description: Clé API absente, mal formée ou inconnue (`authentication_error`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: { error: { type: authentication_error, code: missing_api_key, message: 'Aucune clé API fournie. Utilisez « Authorization: Bearer <clé> ».' } }
+    Forbidden:
+      description: Clé publique sur une route réservée à la clé secrète (`permission_error`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: { error: { type: permission_error, code: secret_key_required, message: 'Cette route exige la clé secrète (sk_test_...).' } }
+    NotFound:
+      description: Objet inexistant (`not_found`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: { error: { type: not_found, code: resource_missing, message: 'Aucun(e) customer avec l''id "cus_inconnu".', param: id } }
+    Conflict:
+      description: Transition d'état interdite (`state_error`) ou conflit d'idempotence (`idempotency_error`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            etat:
+              summary: Transition interdite
+              value: { error: { type: state_error, code: payment_intent_unexpected_state, message: 'Action « capture » impossible : le payment intent pi_… est au statut « canceled » (statuts permis : requires_capture).' } }
+            idempotence:
+              summary: Idempotency-Key réutilisée avec une autre requête
+              value: { error: { type: idempotency_error, code: idempotency_key_reused, message: 'Cette Idempotency-Key a déjà été utilisée avec une requête différente (méthode, chemin ou corps).' } }
+    CardDeclined:
+      description: |
+        Carte refusée (`card_error`). `code` : `card_declined`, `expired_card`, `incorrect_cvc`, `amount_too_large`,
+        `payment_intent_authentication_failure` ; `decline_code` précise le motif (`insufficient_funds`,
+        `authentication_required`, `authentication_failed`, …). L'échec est enregistré **avant** la réponse :
+        `error.payment_intent` est le payment intent à jour (`requires_payment_method`, `last_payment_error` renseigné).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/CardError'
+    InsufficientBalance:
+      description: Solde insuffisant pour ce mouvement de fonds (`insufficient_balance`, type `invalid_request_error`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: { error: { type: invalid_request_error, code: insufficient_balance, message: 'Solde vendeur insuffisant : 3180 disponible(s), 10000000 demandé(s).', param: amount } }
+    TooManyRequests:
+      description: Plus de 300 requêtes par minute (`rate_limit_error`). En-têtes `RateLimit-*` (draft-7).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example: { error: { type: rate_limit_error, code: rate_limit, message: 'Trop de requêtes, réessayez plus tard.' } }
+
+  schemas:
+    # ------------------------------------------------------------ Types de base
+    Timestamp:
+      type: integer
+      description: Horodatage Unix en secondes.
+      examples: [1767225600]
+    Amount:
+      type: integer
+      description: Montant en centimes (entier).
+      minimum: 1
+      maximum: 99999999
+      examples: [2500]
+    Currency:
+      type: string
+      description: Devise ISO 4217 en minuscules. Seul `eur` est accepté.
+      enum: [eur]
+    Metadata:
+      type: object
+      description: Paires clé/valeur libres (50 clés max, clés de 40 caractères max, valeurs de 500 caractères max).
+      maxProperties: 50
+      propertyNames:
+        minLength: 1
+        maxLength: 40
+      additionalProperties:
+        type: string
+        maxLength: 500
+      examples: [{ order: '42' }]
+    List:
+      type: object
+      description: Enveloppe de liste paginée, du plus récent au plus ancien.
+      required: [object, data, has_more]
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items: {}
+        has_more:
+          type: boolean
+          description: Vrai s'il reste des objets après le dernier de `data` (relancer avec `starting_after`).
+    Deleted:
+      type: object
+      required: [id, object, deleted]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+        deleted:
+          type: boolean
+          enum: [true]
+      examples: [{ id: we_lFzBmZ3yY3Gqp678xapqhLOw, object: webhook_endpoint, deleted: true }]
+    Health:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          enum: [true]
+
+    # ------------------------------------------------------------ Erreurs
+    Error:
+      type: object
+      description: Toute erreur de l'API (HTTP 4xx / 5xx).
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, code, message]
+          properties:
+            type:
+              type: string
+              description: Famille d'erreur, liée au code HTTP.
+              enum:
+                - invalid_request_error
+                - authentication_error
+                - permission_error
+                - not_found
+                - card_error
+                - idempotency_error
+                - state_error
+                - rate_limit_error
+                - api_error
+            code:
+              type: string
+              description: Code précis (`parameter_invalid`, `parameter_missing`, `resource_missing`, `amount_too_large`, `invalid_api_key`, `payment_intent_unexpected_state`, …).
+            message:
+              type: string
+              description: Message lisible, en français. Ne contient jamais un numéro de carte ni un secret.
+            param:
+              type: string
+              description: Paramètre en cause, le cas échéant (`card.number`, `amount`, `limit`, `id`, …).
+          additionalProperties: true
+      examples:
+        - error: { type: invalid_request_error, code: parameter_invalid, message: 'limit doit être un entier entre 1 et 100.', param: limit }
+    LastPaymentError:
+      type: object
+      description: Dernier refus enregistré sur un payment intent ou une facture.
+      required: [type, code, message]
+      properties:
+        type:
+          type: string
+          enum: [card_error]
+        code:
+          type: string
+          description: '`card_declined`, `expired_card`, `incorrect_cvc`, `amount_too_large`, `payment_intent_authentication_failure`, `payment_method_missing`.'
+        decline_code:
+          type: [string, 'null']
+          description: Motif du réseau (`card_declined`, `insufficient_funds`, `expired_card`, `incorrect_cvc`, `authentication_required`, `authentication_failed`, `amount_too_large`).
+        message:
+          type: string
+        charge:
+          type: [string, 'null']
+          description: Charge `failed` correspondante (`ch_…`).
+        payment_method:
+          type: [string, 'null']
+      additionalProperties: true
+      examples:
+        - { type: card_error, code: card_declined, decline_code: card_declined, message: La carte a été refusée., charge: ch_KxCC5XYp7EYYcH6NIGECLMNb, payment_method: pm_BYy98BXByKn2WdMB3oqchDeO }
+    CardError:
+      type: object
+      description: Réponse 402 d'un refus carte sur un payment intent ou une facture.
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, code, message, decline_code, payment_intent]
+          properties:
+            type:
+              type: string
+              enum: [card_error]
+            code:
+              type: string
+            message:
+              type: string
+            decline_code:
+              type: string
+            charge:
+              type: [string, 'null']
+              description: Charge `failed` créée par la tentative (`ch_…`), `null` si le réseau n'a pas été sollicité.
+            payment_intent:
+              $ref: '#/components/schemas/PaymentIntent'
+      examples:
+        - error:
+            type: card_error
+            code: card_declined
+            message: La carte a été refusée.
+            decline_code: card_declined
+            charge: ch_KxCC5XYp7EYYcH6NIGECLMNb
+            payment_intent:
+              id: pi_DcpYTLHSGBQ6DBazM8T4Zo39
+              object: payment_intent
+              amount: 1500
+              amount_capturable: 0
+              amount_received: 0
+              currency: eur
+              status: requires_payment_method
+              capture_method: automatic
+              customer: null
+              payment_method: null
+              off_session: false
+              application_fee_amount: null
+              transfer_data: null
+              description: null
+              metadata: {}
+              last_payment_error: { type: card_error, code: card_declined, decline_code: card_declined, message: La carte a été refusée., charge: ch_KxCC5XYp7EYYcH6NIGECLMNb, payment_method: pm_BYy98BXByKn2WdMB3oqchDeO }
+              next_action: null
+              latest_charge: ch_KxCC5XYp7EYYcH6NIGECLMNb
+              canceled_at: null
+              cancellation_reason: null
+              created: 1767225600
+              client_secret: pi_DcpYTLHSGBQ6DBazM8T4Zo39_secret_rKLWAEC6cMNmYsbBeWWOW0ly
+    DemoCardError:
+      type: object
+      description: Réponse 402 de `POST /demo/subscribe`.
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, code, message, decline_code, subscription, invoice]
+          properties:
+            type:
+              type: string
+              enum: [card_error]
+            code:
+              type: string
+            message:
+              type: string
+            decline_code:
+              type: string
+            subscription:
+              $ref: '#/components/schemas/DemoSubscriptionSummary'
+            invoice:
+              $ref: '#/components/schemas/DemoInvoiceSummary'
+      examples:
+        - error:
+            type: card_error
+            code: card_declined
+            message: La carte a été refusée.
+            decline_code: card_declined
+            subscription: { id: sub_MPUZdDW8MGiwZinhRDRMxuy5, status: incomplete, current_period_start: 1767229200, current_period_end: 1769907600 }
+            invoice: { id: in_x1ZyJWWrEJebAPeHu6yxNNsn, status: open, amount_due: 990, amount_paid: 0, currency: eur }
+
+    # ------------------------------------------------------------ Clients
+    CustomerCreate:
+      type: object
+      required: [email]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+    CustomerUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        name:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 200
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+        invoice_settings:
+          type: object
+          required: [default_payment_method]
+          additionalProperties: false
+          properties:
+            default_payment_method:
+              type: [string, 'null']
+              description: Moyen de paiement (`pm_…`) déjà rattaché à ce client, ou `null`.
+    Customer:
+      type: object
+      required: [id, object, email, name, metadata, invoice_settings, created]
+      properties:
+        id:
+          type: string
+          examples: [cus_o34T0KX2MlBFoyU3z6kgKXp2]
+        object:
+          type: string
+          enum: [customer]
+        email:
+          type: string
+          format: email
+        name:
+          type: [string, 'null']
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+        invoice_settings:
+          type: object
+          required: [default_payment_method]
+          properties:
+            default_payment_method:
+              type: [string, 'null']
+              description: Moyen de paiement utilisé par défaut pour les factures d'abonnement.
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: cus_o34T0KX2MlBFoyU3z6kgKXp2, object: customer, email: alice@example.com, name: Alice Martin, metadata: { crm_id: '42' }, invoice_settings: { default_payment_method: pm_CaNPHU2gQyuNSpmzIsMC9qOw }, created: 1767225600 }
+    CustomerList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Customer'
+
+    # ------------------------------------------------------------ Moyens de paiement
+    PaymentMethodCreate:
+      type: object
+      required: [card]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [card]
+        card:
+          type: object
+          required: [number, exp_month, exp_year, cvc]
+          additionalProperties: false
+          properties:
+            number:
+              type: string
+              description: Numéro de carte (13 à 19 chiffres, Luhn valide ; espaces tolérés).
+              minLength: 1
+              maxLength: 32
+            exp_month:
+              type: integer
+              minimum: 1
+              maximum: 12
+            exp_year:
+              type: integer
+              minimum: 2000
+              maximum: 2200
+            cvc:
+              type: string
+              description: 3 ou 4 chiffres. Vérifié puis jamais stocké.
+              maxLength: 8
+    PaymentMethodAttach:
+      type: object
+      required: [customer]
+      additionalProperties: false
+      properties:
+        customer:
+          type: string
+          description: Client (`cus_…`) auquel rattacher le moyen de paiement.
+    PaymentMethod:
+      type: object
+      required: [id, object, type, card, customer, created]
+      properties:
+        id:
+          type: string
+          examples: [pm_CaNPHU2gQyuNSpmzIsMC9qOw]
+        object:
+          type: string
+          enum: [payment_method]
+        type:
+          type: string
+          enum: [card]
+        card:
+          type: object
+          required: [brand, last4, exp_month, exp_year, fingerprint, cvc_check]
+          properties:
+            brand:
+              type: string
+              enum: [visa, mastercard, amex]
+            last4:
+              type: string
+              pattern: '^[0-9]{4}$'
+            exp_month:
+              type: integer
+            exp_year:
+              type: integer
+            fingerprint:
+              type: string
+              description: HMAC-SHA256 du numéro de carte, stable pour une même carte (déduplication).
+            cvc_check:
+              type: string
+              enum: [pass, fail]
+        customer:
+          type: [string, 'null']
+          description: Client auquel le moyen de paiement est rattaché.
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: pm_CaNPHU2gQyuNSpmzIsMC9qOw, object: payment_method, type: card, card: { brand: visa, last4: '4242', exp_month: 12, exp_year: 2030, fingerprint: 05a62f7ca79521d4ad9629b58d8befcc5a27c8f068757900c9e8c561fad94275, cvc_check: pass }, customer: null, created: 1767225600 }
+    PaymentMethodList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/PaymentMethod'
+
+    # ------------------------------------------------------------ Paiements
+    PaymentIntentStatus:
+      type: string
+      enum: [requires_payment_method, requires_confirmation, requires_action, requires_capture, succeeded, canceled]
+    PaymentIntentCreate:
+      type: object
+      required: [amount, currency]
+      additionalProperties: false
+      properties:
+        amount:
+          $ref: '#/components/schemas/Amount'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        customer:
+          type: string
+          description: Client (`cus_…`). Si `payment_method` est rattaché à un client, ce doit être le même.
+        payment_method:
+          type: string
+          description: Moyen de paiement (`pm_…`).
+        capture_method:
+          type: string
+          enum: [automatic, manual]
+          default: automatic
+          description: '`manual` : autoriser maintenant (`requires_capture`), capturer plus tard (7 jours max).'
+        confirm:
+          type: boolean
+          default: false
+          description: Tenter l'autorisation immédiatement.
+        off_session:
+          type: boolean
+          default: false
+          description: Paiement sans le client (relance d'abonnement) ; une carte exigeant 3-D Secure est alors refusée `authentication_required`.
+        application_fee_amount:
+          type: integer
+          minimum: 0
+          description: Commission plateforme (centimes) sur un paiement partagé ; doit rester inférieure au montant capturé.
+        transfer_data:
+          type: object
+          required: [destination]
+          additionalProperties: false
+          properties:
+            destination:
+              type: string
+              description: Compte vendeur (`acct_…`) qui reçoit le montant moins la commission.
+        description:
+          type: string
+          maxLength: 1000
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+    PaymentIntentConfirm:
+      type: object
+      additionalProperties: false
+      properties:
+        payment_method:
+          type: string
+          description: Moyen de paiement à utiliser (remplace celui du payment intent).
+        client_secret:
+          type: string
+          description: Obligatoire avec la clé publique.
+    PaymentIntentCapture:
+      type: object
+      additionalProperties: false
+      properties:
+        amount_to_capture:
+          $ref: '#/components/schemas/Amount'
+    PaymentIntentCancel:
+      type: object
+      additionalProperties: false
+      properties:
+        cancellation_reason:
+          type: string
+          enum: [duplicate, fraudulent, requested_by_customer, abandoned]
+    ThreeDsComplete:
+      type: object
+      required: [result]
+      additionalProperties: false
+      properties:
+        result:
+          type: string
+          enum: [approve, deny]
+          description: Résultat simulé de l'authentification du porteur.
+        client_secret:
+          type: string
+          description: Obligatoire avec la clé publique.
+    PaymentIntent:
+      type: object
+      required:
+        - id
+        - object
+        - amount
+        - amount_capturable
+        - amount_received
+        - currency
+        - status
+        - capture_method
+        - customer
+        - payment_method
+        - off_session
+        - application_fee_amount
+        - transfer_data
+        - description
+        - metadata
+        - last_payment_error
+        - next_action
+        - latest_charge
+        - canceled_at
+        - cancellation_reason
+        - created
+      properties:
+        id:
+          type: string
+          examples: [pi_MR6CPNmfpuTMzysaMJBJPmHl]
+        object:
+          type: string
+          enum: [payment_intent]
+        amount:
+          type: integer
+          description: Montant demandé (centimes).
+        amount_capturable:
+          type: integer
+          description: Montant autorisé en attente de capture (`requires_capture`).
+        amount_received:
+          type: integer
+          description: Montant capturé.
+        currency:
+          $ref: '#/components/schemas/Currency'
+        status:
+          $ref: '#/components/schemas/PaymentIntentStatus'
+        capture_method:
+          type: string
+          enum: [automatic, manual]
+        customer:
+          type: [string, 'null']
+        payment_method:
+          type: [string, 'null']
+          description: Moyen de paiement associé ; redevient `null` après un refus.
+        off_session:
+          type: boolean
+        application_fee_amount:
+          type: [integer, 'null']
+        transfer_data:
+          type: [object, 'null']
+          properties:
+            destination:
+              type: string
+        description:
+          type: [string, 'null']
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+        last_payment_error:
+          oneOf:
+            - $ref: '#/components/schemas/LastPaymentError'
+            - type: 'null'
+        next_action:
+          type: [object, 'null']
+          description: Action attendue du client (`requires_action`).
+          properties:
+            type:
+              type: string
+              enum: [three_d_secure]
+            challenge_id:
+              type: string
+              description: Défi à terminer via `POST /v1/three_ds/{challenge_id}/complete`.
+        latest_charge:
+          type: [string, 'null']
+          description: Dernière charge créée (`ch_…`), réussie ou non.
+        canceled_at:
+          type: [integer, 'null']
+        cancellation_reason:
+          type: [string, 'null']
+          description: '`duplicate`, `fraudulent`, `requested_by_customer`, `abandoned`, ou `expired` (autorisation de plus de 7 jours).'
+        created:
+          $ref: '#/components/schemas/Timestamp'
+        client_secret:
+          type: string
+          description: Secret à transmettre au navigateur pour confirmer avec la clé publique. Absent des événements et des webhooks.
+      examples:
+        - { id: pi_MR6CPNmfpuTMzysaMJBJPmHl, object: payment_intent, amount: 2500, amount_capturable: 0, amount_received: 2500, currency: eur, status: succeeded, capture_method: automatic, customer: cus_o34T0KX2MlBFoyU3z6kgKXp2, payment_method: pm_CaNPHU2gQyuNSpmzIsMC9qOw, off_session: false, application_fee_amount: null, transfer_data: null, description: 'Commande #42', metadata: { order: '42' }, last_payment_error: null, next_action: null, latest_charge: ch_5GDhLjaWaek37aQAwDo9TbYY, canceled_at: null, cancellation_reason: null, created: 1767225600, client_secret: pi_MR6CPNmfpuTMzysaMJBJPmHl_secret__9lFbOcD_2hq2i5loBoHvGv_ }
+    PaymentIntentList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/PaymentIntent'
+    Charge:
+      type: object
+      description: Une tentative d'autorisation, réussie ou refusée.
+      required: [id, object, payment_intent, payment_method, customer, amount, amount_captured, amount_refunded, refunded, currency, status, captured, failure_code, failure_message, outcome, payment_method_details, created]
+      properties:
+        id:
+          type: string
+          examples: [ch_5GDhLjaWaek37aQAwDo9TbYY]
+        object:
+          type: string
+          enum: [charge]
+        payment_intent:
+          type: string
+        payment_method:
+          type: string
+        customer:
+          type: [string, 'null']
+        amount:
+          type: integer
+          description: Montant autorisé.
+        amount_captured:
+          type: integer
+        amount_refunded:
+          type: integer
+        refunded:
+          type: boolean
+          description: Vrai quand tout le montant capturé a été remboursé.
+        currency:
+          $ref: '#/components/schemas/Currency'
+        status:
+          type: string
+          enum: [succeeded, failed]
+        captured:
+          type: boolean
+        failure_code:
+          type: [string, 'null']
+          description: Code d'erreur API du refus (`card_declined`, `expired_card`, `incorrect_cvc`, `amount_too_large`, …).
+        failure_message:
+          type: [string, 'null']
+        outcome:
+          type: object
+          description: Décision du réseau simulé.
+          required: [type, network_status, seller_message]
+          properties:
+            type:
+              type: string
+              enum: [authorized, issuer_declined]
+            network_status:
+              type: string
+              enum: [approved_by_network, declined_by_network]
+            reason:
+              type: string
+              description: Motif de refus (`decline_code`), présent si refusée.
+            seller_message:
+              type: string
+        payment_method_details:
+          type: object
+          required: [type, card]
+          properties:
+            type:
+              type: string
+              enum: [card]
+            card:
+              type: object
+              required: [brand, last4, three_d_secure]
+              properties:
+                brand:
+                  type: string
+                last4:
+                  type: string
+                three_d_secure:
+                  type: [string, 'null']
+                  description: '`authenticated` si le porteur a passé le défi 3-D Secure, sinon `null`.'
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: ch_5GDhLjaWaek37aQAwDo9TbYY, object: charge, payment_intent: pi_MR6CPNmfpuTMzysaMJBJPmHl, payment_method: pm_CaNPHU2gQyuNSpmzIsMC9qOw, customer: cus_o34T0KX2MlBFoyU3z6kgKXp2, amount: 2500, amount_captured: 2500, amount_refunded: 0, refunded: false, currency: eur, status: succeeded, captured: true, failure_code: null, failure_message: null, outcome: { type: authorized, network_status: approved_by_network, seller_message: Paiement autorisé. }, payment_method_details: { type: card, card: { brand: visa, last4: '4242', three_d_secure: null } }, created: 1767225600 }
+    ChargeList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Charge'
+
+    # ------------------------------------------------------------ Remboursements
+    RefundCreate:
+      type: object
+      required: [payment_intent]
+      additionalProperties: false
+      properties:
+        payment_intent:
+          type: string
+          description: Payment intent `succeeded` à rembourser.
+        amount:
+          $ref: '#/components/schemas/Amount'
+        reason:
+          type: string
+          enum: [duplicate, fraudulent, requested_by_customer]
+        refund_application_fee:
+          type: boolean
+          default: false
+          description: 'Paiement partagé seulement : restituer au vendeur la part de commission correspondant au montant remboursé.'
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+    Refund:
+      type: object
+      required: [id, object, amount, currency, payment_intent, charge, status, reason, refund_application_fee, application_fee_refunded, metadata, created]
+      properties:
+        id:
+          type: string
+          examples: [re_40wpvx7ZBiA77pcOLXnmMqHP]
+        object:
+          type: string
+          enum: [refund]
+        amount:
+          type: integer
+        currency:
+          $ref: '#/components/schemas/Currency'
+        payment_intent:
+          type: string
+        charge:
+          type: string
+        status:
+          type: string
+          enum: [succeeded]
+        reason:
+          type: [string, 'null']
+          description: '`duplicate`, `fraudulent` ou `requested_by_customer`.'
+        refund_application_fee:
+          type: boolean
+        application_fee_refunded:
+          type: integer
+          description: Part de commission restituée au vendeur (centimes).
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: re_40wpvx7ZBiA77pcOLXnmMqHP, object: refund, amount: 500, currency: eur, payment_intent: pi_MR6CPNmfpuTMzysaMJBJPmHl, charge: ch_5GDhLjaWaek37aQAwDo9TbYY, status: succeeded, reason: requested_by_customer, refund_application_fee: false, application_fee_refunded: 0, metadata: { ticket: SAV-7 }, created: 1767225600 }
+    RefundList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Refund'
+
+    # ------------------------------------------------------------ Marketplace
+    AccountCreate:
+      type: object
+      required: [email]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        business_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+    Account:
+      type: object
+      required: [id, object, email, business_name, status, created]
+      properties:
+        id:
+          type: string
+          examples: [acct_eB2xjnH1aoaSaMEQwloapmt4]
+        object:
+          type: string
+          enum: [account]
+        email:
+          type: string
+          format: email
+        business_name:
+          type: [string, 'null']
+        status:
+          type: string
+          enum: [enabled, disabled]
+          description: Un compte `disabled` ne peut plus recevoir de paiements partagés ni de transferts.
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: acct_eB2xjnH1aoaSaMEQwloapmt4, object: account, email: atelier@example.com, business_name: Atelier Lyonnais, status: enabled, created: 1767225600 }
+    AccountList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Account'
+    Balance:
+      type: object
+      required: [object, available]
+      properties:
+        object:
+          type: string
+          enum: [balance]
+        available:
+          type: array
+          items:
+            type: object
+            required: [amount, currency]
+            properties:
+              amount:
+                type: integer
+                description: Solde disponible en centimes ; peut être négatif après des remboursements.
+              currency:
+                $ref: '#/components/schemas/Currency'
+      examples:
+        - { object: balance, available: [{ amount: 4080, currency: eur }] }
+    TransferCreate:
+      type: object
+      required: [amount, destination]
+      additionalProperties: false
+      properties:
+        amount:
+          $ref: '#/components/schemas/Amount'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        destination:
+          type: string
+          description: Compte vendeur (`acct_…`) crédité.
+        description:
+          type: string
+          maxLength: 1000
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+    Transfer:
+      type: object
+      required: [id, object, amount, currency, destination, description, metadata, created]
+      properties:
+        id:
+          type: string
+          examples: [tr_pCaYneT381HD0yRPEiDneEDZ]
+        object:
+          type: string
+          enum: [transfer]
+        amount:
+          type: integer
+        currency:
+          $ref: '#/components/schemas/Currency'
+        destination:
+          type: string
+        description:
+          type: [string, 'null']
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: tr_pCaYneT381HD0yRPEiDneEDZ, object: transfer, amount: 100, currency: eur, destination: acct_eB2xjnH1aoaSaMEQwloapmt4, description: Bonus, metadata: {}, created: 1767225600 }
+    TransferList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Transfer'
+    PayoutCreate:
+      type: object
+      required: [account, amount]
+      additionalProperties: false
+      properties:
+        account:
+          type: string
+          description: Compte vendeur (`acct_…`) débité.
+        amount:
+          $ref: '#/components/schemas/Amount'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        description:
+          type: string
+          maxLength: 1000
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+    Payout:
+      type: object
+      required: [id, object, account, amount, currency, status, arrival_date, description, metadata, created]
+      properties:
+        id:
+          type: string
+          examples: [po_azVHEVzK7VbDsnNCyLmgLgLc]
+        object:
+          type: string
+          enum: [payout]
+        account:
+          type: string
+        amount:
+          type: integer
+        currency:
+          $ref: '#/components/schemas/Currency'
+        status:
+          type: string
+          enum: [paid]
+        arrival_date:
+          $ref: '#/components/schemas/Timestamp'
+        description:
+          type: [string, 'null']
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: po_azVHEVzK7VbDsnNCyLmgLgLc, object: payout, account: acct_eB2xjnH1aoaSaMEQwloapmt4, amount: 1000, currency: eur, status: paid, arrival_date: 1767225600, description: Virement hebdo, metadata: {}, created: 1767225600 }
+    PayoutList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Payout'
+
+    # ------------------------------------------------------------ Catalogue
+    ProductCreate:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 1000
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+    Product:
+      type: object
+      required: [id, object, name, description, active, metadata, created]
+      properties:
+        id:
+          type: string
+          examples: [prod_yxW1icYcRuS0BCi9pjH3L7Ou]
+        object:
+          type: string
+          enum: [product]
+        name:
+          type: string
+        description:
+          type: [string, 'null']
+        active:
+          type: boolean
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: prod_yxW1icYcRuS0BCi9pjH3L7Ou, object: product, name: Café du mois, description: Sélection mensuelle, active: true, metadata: { sku: CAFE-M }, created: 1767225600 }
+    ProductList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Product'
+    Recurring:
+      type: object
+      required: [interval]
+      additionalProperties: false
+      properties:
+        interval:
+          type: string
+          enum: [day, week, month, year]
+        interval_count:
+          type: integer
+          minimum: 1
+          default: 1
+          description: Nombre d'intervalles par période ; la période ne peut pas dépasser un an.
+    PriceCreate:
+      type: object
+      required: [product, unit_amount, currency]
+      additionalProperties: false
+      properties:
+        product:
+          type: string
+          description: Produit (`prod_…`).
+        unit_amount:
+          $ref: '#/components/schemas/Amount'
+        currency:
+          $ref: '#/components/schemas/Currency'
+        recurring:
+          $ref: '#/components/schemas/Recurring'
+        nickname:
+          type: string
+          maxLength: 200
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+    Price:
+      type: object
+      required: [id, object, product, unit_amount, currency, type, recurring, nickname, active, metadata, created]
+      properties:
+        id:
+          type: string
+          examples: [price_7DKNpBxQf2KvtYhpsx880H45]
+        object:
+          type: string
+          enum: [price]
+        product:
+          type: string
+        unit_amount:
+          type: integer
+        currency:
+          $ref: '#/components/schemas/Currency'
+        type:
+          type: string
+          enum: [one_time, recurring]
+        recurring:
+          oneOf:
+            - $ref: '#/components/schemas/Recurring'
+            - type: 'null'
+        nickname:
+          type: [string, 'null']
+        active:
+          type: boolean
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: price_7DKNpBxQf2KvtYhpsx880H45, object: price, product: prod_yxW1icYcRuS0BCi9pjH3L7Ou, unit_amount: 990, currency: eur, type: recurring, recurring: { interval: month, interval_count: 1 }, nickname: Mensuel, active: true, metadata: {}, created: 1767225600 }
+    PriceList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Price'
+
+    # ------------------------------------------------------------ Abonnements
+    SubscriptionStatus:
+      type: string
+      enum: [trialing, active, incomplete, past_due, canceled]
+    InvoiceStatus:
+      type: string
+      enum: [draft, open, paid, uncollectible, void]
+    SubscriptionCreate:
+      type: object
+      required: [customer, price]
+      additionalProperties: false
+      properties:
+        customer:
+          type: string
+          description: Client (`cus_…`).
+        price:
+          type: string
+          description: Prix récurrent (`price_…`).
+        trial_period_days:
+          type: integer
+          minimum: 1
+          maximum: 730
+        default_payment_method:
+          type: string
+          description: Moyen de paiement (`pm_…`) rattaché au client ; sinon `customer.invoice_settings.default_payment_method`.
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+    SubscriptionUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        default_payment_method:
+          type: [string, 'null']
+        cancel_at_period_end:
+          type: boolean
+    SubscriptionCancel:
+      type: object
+      additionalProperties: false
+      properties:
+        at_period_end:
+          type: boolean
+          default: false
+    Subscription:
+      type: object
+      required: [id, object, customer, price, status, default_payment_method, billing_cycle_anchor, current_period_start, current_period_end, trial_start, trial_end, cancel_at_period_end, canceled_at, ended_at, latest_invoice, metadata, created]
+      properties:
+        id:
+          type: string
+          examples: [sub_vOmzmoPAusAZVOEAtg3OlfRC]
+        object:
+          type: string
+          enum: [subscription]
+        customer:
+          type: string
+        price:
+          type: string
+        status:
+          $ref: '#/components/schemas/SubscriptionStatus'
+        default_payment_method:
+          type: [string, 'null']
+        billing_cycle_anchor:
+          $ref: '#/components/schemas/Timestamp'
+        current_period_start:
+          $ref: '#/components/schemas/Timestamp'
+        current_period_end:
+          $ref: '#/components/schemas/Timestamp'
+        trial_start:
+          type: [integer, 'null']
+        trial_end:
+          type: [integer, 'null']
+        cancel_at_period_end:
+          type: boolean
+        canceled_at:
+          type: [integer, 'null']
+        ended_at:
+          type: [integer, 'null']
+        latest_invoice:
+          type: [string, 'null']
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: sub_vOmzmoPAusAZVOEAtg3OlfRC, object: subscription, customer: cus_o34T0KX2MlBFoyU3z6kgKXp2, price: price_7DKNpBxQf2KvtYhpsx880H45, status: active, default_payment_method: null, billing_cycle_anchor: 1767225600, current_period_start: 1767225600, current_period_end: 1769904000, trial_start: null, trial_end: null, cancel_at_period_end: false, canceled_at: null, ended_at: null, latest_invoice: in_mY2HgQ6DGTAmd7qapBMF3jf0, metadata: { plan: mensuel }, created: 1767225600 }
+    SubscriptionList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Subscription'
+    InvoicePay:
+      type: object
+      additionalProperties: false
+      properties:
+        payment_method:
+          type: string
+          description: Moyen de paiement à utiliser pour cette tentative.
+    Invoice:
+      type: object
+      required: [id, object, subscription, customer, status, billing_reason, amount_due, amount_paid, amount_remaining, currency, period_start, period_end, attempt_count, attempted, next_payment_attempt, payment_intent, last_payment_error, status_transitions, created]
+      properties:
+        id:
+          type: string
+          examples: [in_mY2HgQ6DGTAmd7qapBMF3jf0]
+        object:
+          type: string
+          enum: [invoice]
+        subscription:
+          type: string
+        customer:
+          type: string
+        status:
+          $ref: '#/components/schemas/InvoiceStatus'
+        billing_reason:
+          type: string
+          enum: [subscription_create, subscription_cycle]
+        amount_due:
+          type: integer
+        amount_paid:
+          type: integer
+        amount_remaining:
+          type: integer
+        currency:
+          $ref: '#/components/schemas/Currency'
+        period_start:
+          $ref: '#/components/schemas/Timestamp'
+        period_end:
+          $ref: '#/components/schemas/Timestamp'
+        attempt_count:
+          type: integer
+        attempted:
+          type: boolean
+        next_payment_attempt:
+          type: [integer, 'null']
+          description: Prochaine relance automatique (`past_due`), sinon `null`.
+        payment_intent:
+          type: [string, 'null']
+          description: Payment intent interne de la facture (`pi_…`).
+        last_payment_error:
+          oneOf:
+            - $ref: '#/components/schemas/LastPaymentError'
+            - type: 'null'
+        status_transitions:
+          type: object
+          required: [finalized_at, paid_at, marked_uncollectible_at, voided_at]
+          properties:
+            finalized_at:
+              type: [integer, 'null']
+            paid_at:
+              type: [integer, 'null']
+            marked_uncollectible_at:
+              type: [integer, 'null']
+            voided_at:
+              type: [integer, 'null']
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: in_mY2HgQ6DGTAmd7qapBMF3jf0, object: invoice, subscription: sub_vOmzmoPAusAZVOEAtg3OlfRC, customer: cus_o34T0KX2MlBFoyU3z6kgKXp2, status: paid, billing_reason: subscription_create, amount_due: 990, amount_paid: 990, amount_remaining: 0, currency: eur, period_start: 1767225600, period_end: 1769904000, attempt_count: 1, attempted: true, next_payment_attempt: null, payment_intent: pi_36hpzb0Qu3aI8hLKXyr5qSjr, last_payment_error: null, status_transitions: { finalized_at: 1767225600, paid_at: 1767225600, marked_uncollectible_at: null, voided_at: null }, created: 1767225600 }
+    InvoiceList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Invoice'
+
+    # ------------------------------------------------------------ Webhooks
+    EventType:
+      type: string
+      description: Type d'événement émis par PaySim.
+      enum:
+        - customer.created
+        - customer.updated
+        - payment_method.created
+        - payment_method.attached
+        - payment_intent.created
+        - payment_intent.requires_action
+        - payment_intent.amount_capturable_updated
+        - payment_intent.succeeded
+        - payment_intent.payment_failed
+        - payment_intent.canceled
+        - charge.succeeded
+        - charge.failed
+        - charge.captured
+        - refund.created
+        - charge.refunded
+        - account.created
+        - transfer.created
+        - payout.paid
+        - product.created
+        - price.created
+        - customer.subscription.created
+        - customer.subscription.updated
+        - customer.subscription.deleted
+        - invoice.created
+        - invoice.finalized
+        - invoice.paid
+        - invoice.payment_failed
+        - invoice.marked_uncollectible
+        - invoice.voided
+    EventTypeList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/EventType'
+    WebhookDeliveryStatus:
+      type: string
+      enum: [pending, sending, delivered, failed]
+    WebhookEndpointCreate:
+      type: object
+      required: [url, enabled_events]
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          format: uri
+          minLength: 1
+          maxLength: 2048
+          description: URL `http:` ou `https:` du récepteur, sans identifiants.
+        enabled_events:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: string
+            minLength: 1
+            maxLength: 100
+          description: '`["*"]` pour tout recevoir, ou des types de `GET /v1/event_types`.'
+        description:
+          type: string
+          maxLength: 1000
+    WebhookEndpointUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          format: uri
+          minLength: 1
+          maxLength: 2048
+        enabled_events:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: string
+            minLength: 1
+            maxLength: 100
+        description:
+          type: [string, 'null']
+          maxLength: 1000
+        disabled:
+          type: boolean
+          description: '`true` suspend les livraisons, `false` les reprend.'
+    WebhookEndpoint:
+      type: object
+      required: [id, object, url, enabled_events, description, status, created]
+      properties:
+        id:
+          type: string
+          examples: [we_lFzBmZ3yY3Gqp678xapqhLOw]
+        object:
+          type: string
+          enum: [webhook_endpoint]
+        url:
+          type: string
+          format: uri
+        enabled_events:
+          type: array
+          items:
+            type: string
+        description:
+          type: [string, 'null']
+        status:
+          type: string
+          enum: [enabled, disabled]
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: we_lFzBmZ3yY3Gqp678xapqhLOw, object: webhook_endpoint, url: 'https://marchand.example.com/paysim/webhook', enabled_events: ['*'], description: Serveur marchand, status: enabled, created: 1767225600 }
+    WebhookEndpointWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEndpoint'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: Secret de signature (`whsec_…`), renvoyé uniquement à la création. Stocké chiffré côté PaySim.
+      examples:
+        - { id: we_lFzBmZ3yY3Gqp678xapqhLOw, object: webhook_endpoint, url: 'https://marchand.example.com/paysim/webhook', enabled_events: ['*'], description: Serveur marchand, status: enabled, created: 1767225600, secret: whsec_exempleRenvoyeUneFois }
+    WebhookEndpointList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/WebhookEndpoint'
+    WebhookDelivery:
+      type: object
+      required: [id, object, endpoint, event, event_type, status, attempts, next_attempt_at, last_attempt_at, last_status_code, last_error, delivered_at, created]
+      properties:
+        id:
+          type: string
+          examples: [whd_8ykacvX0klxkmH0qMl7Steoi]
+        object:
+          type: string
+          enum: [webhook_delivery]
+        endpoint:
+          type: string
+        event:
+          type: string
+        event_type:
+          $ref: '#/components/schemas/EventType'
+        status:
+          $ref: '#/components/schemas/WebhookDeliveryStatus'
+        attempts:
+          type: integer
+          description: Tentatives effectuées (6 au maximum).
+        next_attempt_at:
+          type: [integer, 'null']
+        last_attempt_at:
+          type: [integer, 'null']
+        last_status_code:
+          type: [integer, 'null']
+          description: Code HTTP de la dernière réponse du récepteur, `null` si aucune réponse.
+        last_error:
+          type: [string, 'null']
+          description: '`HTTP <code>`, `timeout après N ms` ou `erreur réseau : <code>`.'
+        delivered_at:
+          type: [integer, 'null']
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - { id: whd_8ykacvX0klxkmH0qMl7Steoi, object: webhook_delivery, endpoint: we_lFzBmZ3yY3Gqp678xapqhLOw, event: evt_2waQxIZhXABj5PguyKhTo6TF, event_type: invoice.payment_failed, status: pending, attempts: 1, next_attempt_at: 1767229260, last_attempt_at: 1767229200, last_status_code: null, last_error: 'erreur réseau : ECONNREFUSED', delivered_at: null, created: 1767225600 }
+    WebhookDeliveryList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/WebhookDelivery'
+
+    # ------------------------------------------------------------ Événements
+    Event:
+      type: object
+      description: Événement émis par PaySim ; `data.object` est l'objet concerné dans son état au moment de l'événement (sans `client_secret`).
+      required: [id, object, type, data, created]
+      properties:
+        id:
+          type: string
+          examples: [evt_dDC6wOMJTGxBHuDMRaOJ9ZeX]
+        object:
+          type: string
+          enum: [event]
+        type:
+          $ref: '#/components/schemas/EventType'
+        data:
+          type: object
+          required: [object]
+          properties:
+            object:
+              type: object
+              description: Objet concerné (payment intent, charge, facture, …).
+              additionalProperties: true
+        created:
+          $ref: '#/components/schemas/Timestamp'
+      examples:
+        - id: evt_dDC6wOMJTGxBHuDMRaOJ9ZeX
+          object: event
+          type: payment_intent.succeeded
+          data:
+            object: { id: pi_36hpzb0Qu3aI8hLKXyr5qSjr, object: payment_intent, amount: 990, amount_capturable: 0, amount_received: 990, currency: eur, status: succeeded, capture_method: automatic, customer: cus_o34T0KX2MlBFoyU3z6kgKXp2, payment_method: pm_CaNPHU2gQyuNSpmzIsMC9qOw, off_session: true, application_fee_amount: null, transfer_data: null, description: 'Facture in_mY2HgQ6DGTAmd7qapBMF3jf0 (abonnement sub_vOmzmoPAusAZVOEAtg3OlfRC)', metadata: { invoice: in_mY2HgQ6DGTAmd7qapBMF3jf0, subscription: sub_vOmzmoPAusAZVOEAtg3OlfRC }, last_payment_error: null, next_action: null, latest_charge: ch_uuRIfKID3axg20ga3OdzVXTP, canceled_at: null, cancellation_reason: null, created: 1767225600 }
+          created: 1767225600
+    EventList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/Event'
+
+    # ------------------------------------------------------------ Grand livre
+    LedgerCheck:
+      type: object
+      required: [object, balanced, total, entries, unbalanced_transactions]
+      properties:
+        object:
+          type: string
+          enum: [ledger_check]
+        balanced:
+          type: boolean
+        total:
+          type: integer
+          description: Somme de toutes les écritures (0 si équilibré).
+        entries:
+          type: integer
+          description: Nombre d'écritures.
+        unbalanced_transactions:
+          type: array
+          items:
+            type: string
+      examples:
+        - { object: ledger_check, balanced: true, total: 0, entries: 31, unbalanced_transactions: [] }
+    LedgerAccount:
+      type: object
+      required: [object, code, type, balance, net, entries]
+      properties:
+        object:
+          type: string
+          enum: [ledger_account]
+        code:
+          type: string
+          description: '`network_receivable`, `platform_balance`, `psp_revenue`, `bank_payouts` ou `merchant:<acct_id>`.'
+        type:
+          type: string
+          enum: [asset, liability, revenue]
+        balance:
+          type: integer
+          description: Solde affiché (positif pour un passif créditeur).
+        net:
+          type: integer
+          description: Somme signée des écritures (+ débit, − crédit).
+        entries:
+          type: integer
+      examples:
+        - { object: ledger_account, code: network_receivable, type: asset, balance: 13789, net: 13789, entries: 7 }
+    LedgerAccountList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/LedgerAccount'
+    LedgerTransaction:
+      type: object
+      required: [id, object, kind, ref_id, created, entries]
+      properties:
+        id:
+          type: string
+          examples: [txn_4Z0JCA06qyno0N7aNLOsfw7h]
+        object:
+          type: string
+          enum: [ledger_transaction]
+        kind:
+          type: string
+          enum: [capture, refund, transfer, payout]
+        ref_id:
+          type: [string, 'null']
+          description: Objet à l'origine de la transaction (`pi_…`, `re_…`, `tr_…`, `po_…`).
+        created:
+          $ref: '#/components/schemas/Timestamp'
+        entries:
+          type: array
+          description: Écritures ; leur somme vaut 0.
+          items:
+            type: object
+            required: [account, amount]
+            properties:
+              account:
+                type: string
+              amount:
+                type: integer
+                description: Signé (+ débit, − crédit).
+      examples:
+        - { id: txn_4Z0JCA06qyno0N7aNLOsfw7h, object: ledger_transaction, kind: capture, ref_id: pi_MR6CPNmfpuTMzysaMJBJPmHl, created: 1767225600, entries: [{ account: network_receivable, amount: 2500 }, { account: platform_balance, amount: -2500 }, { account: platform_balance, amount: 60 }, { account: psp_revenue, amount: -60 }] }
+    LedgerTransactionList:
+      allOf:
+        - $ref: '#/components/schemas/List'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/LedgerTransaction'
+
+    # ------------------------------------------------------------ Horloge de test
+    TestClock:
+      type: object
+      required: [object, now, frozen]
+      properties:
+        object:
+          type: string
+          enum: [test_clock]
+        now:
+          $ref: '#/components/schemas/Timestamp'
+        frozen:
+          type: boolean
+          description: Vrai si l'horloge est gelée (tests) ; sur le serveur réel, le temps avance avec un décalage.
+      examples:
+        - { object: test_clock, now: 1767225600, frozen: false }
+    TestClockAdvance:
+      type: object
+      required: [seconds]
+      additionalProperties: false
+      properties:
+        seconds:
+          type: integer
+          minimum: 1
+          maximum: 158112000
+          description: Secondes à ajouter (entier > 0, au plus 5 ans).
+    TestClockAdvanceResult:
+      type: object
+      required: [object, now, frozen, previous, advanced_by, results]
+      properties:
+        object:
+          type: string
+          enum: [test_clock]
+        now:
+          $ref: '#/components/schemas/Timestamp'
+        frozen:
+          type: boolean
+        previous:
+          $ref: '#/components/schemas/Timestamp'
+        advanced_by:
+          type: integer
+        results:
+          type: object
+          required: [expired_authorizations, billing, hooks]
+          properties:
+            expired_authorizations:
+              type: array
+              description: 'Payment intents passés `canceled` (`cancellation_reason: expired`).'
+              items:
+                type: string
+            billing:
+              type: object
+              description: Résumé du cycle de facturation.
+              required: [subscriptions_processed, invoices_created, invoices_paid, payment_failures, subscriptions_canceled, errors]
+              properties:
+                subscriptions_processed:
+                  type: integer
+                invoices_created:
+                  type: array
+                  items:
+                    type: string
+                invoices_paid:
+                  type: array
+                  items:
+                    type: string
+                payment_failures:
+                  type: array
+                  items:
+                    type: string
+                subscriptions_canceled:
+                  type: array
+                  items:
+                    type: string
+                errors:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: true
+            hooks:
+              type: object
+              description: Résultat de chaque tâche branchée sur l'horloge (`{ error }` si elle a échoué).
+              properties:
+                webhooks:
+                  type: object
+                  properties:
+                    attempted:
+                      type: integer
+                    delivered:
+                      type: array
+                      items:
+                        type: string
+                    retry_scheduled:
+                      type: array
+                      items:
+                        type: string
+                    failed:
+                      type: array
+                      items:
+                        type: string
+                    error:
+                      type: string
+              additionalProperties: true
+      examples:
+        - { object: test_clock, now: 1769904000, frozen: false, previous: 1767225600, advanced_by: 2678400, results: { expired_authorizations: [pi_1GxsleS1xCacqXR9iWk4tx7p], billing: { subscriptions_processed: 1, invoices_created: [in_8Qm2kR0dT1Yv3WbL5nC7eA9z], invoices_paid: [in_8Qm2kR0dT1Yv3WbL5nC7eA9z], payment_failures: [], subscriptions_canceled: [], errors: [] }, hooks: { webhooks: { attempted: 4, delivered: [whd_Y5DbP7aDw77fG2mNYLNZSs8g], retry_scheduled: [], failed: [] } } } }
+
+    # ------------------------------------------------------------ Démo marchand
+    DemoConfig:
+      type: object
+      required: [shop, publishableKey, products, subscriptionPrice]
+      properties:
+        shop:
+          type: string
+        publishableKey:
+          type: string
+          description: Clé publique à utiliser dans le navigateur pour tokeniser la carte.
+        products:
+          type: array
+          items:
+            type: object
+            required: [id, price, name, description, amount, currency, marketplace]
+            properties:
+              id:
+                type: string
+              price:
+                type: string
+              name:
+                type: string
+              description:
+                type: string
+              amount:
+                type: integer
+              currency:
+                $ref: '#/components/schemas/Currency'
+              marketplace:
+                type: [object, 'null']
+                description: Renseigné pour un produit vendu par un vendeur partenaire (paiement partagé).
+                properties:
+                  seller:
+                    type: string
+                  seller_name:
+                    type: string
+                  platform_fee_percent:
+                    type: integer
+                  application_fee_amount:
+                    type: integer
+        subscriptionPrice:
+          type: object
+          required: [id, product, name, description, unit_amount, currency, interval]
+          properties:
+            id:
+              type: string
+            product:
+              type: string
+            name:
+              type: string
+            description:
+              type: string
+            unit_amount:
+              type: integer
+            currency:
+              $ref: '#/components/schemas/Currency'
+            interval:
+              type: string
+      examples:
+        - shop: Comptoir des Pentes
+          publishableKey: pk_test_paysimDevPublishableKey00000000
+          products:
+            - { id: prod_Bibx7ISeUCFszg3y4xOvw7kn, price: price_4g8rS9pwCrE7qZ2ZJbHk9b5u, name: 'Café de la Croix-Rousse, 250 g', description: 'Torréfié chaque semaine sur les pentes, en grains.', amount: 1250, currency: eur, marketplace: null }
+            - { id: prod_le1wueOrEV7J6lxddLBmYl7A, price: price_MCaAxgAIzTRqSkuK4uIzyKTi, name: Planche à découper en noyer, description: 'Fabriquée à Lyon par l''Atelier Lyonnais, vendeur partenaire.', amount: 4800, currency: eur, marketplace: { seller: acct_HQht3neispyK1sG2zOmlom4U, seller_name: Atelier Lyonnais, platform_fee_percent: 15, application_fee_amount: 720 } }
+          subscriptionPrice: { id: price_eLJ6zCcpewMTm5hdKtt3RvS2, product: prod_KoSziKXv6iLtNoQJrgDUdUKR, name: Café du mois, description: '250 g d''un café différent, livré chaque mois.', unit_amount: 990, currency: eur, interval: month }
+    DemoCheckout:
+      type: object
+      required: [productId]
+      additionalProperties: false
+      properties:
+        productId:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Produit du catalogue (`GET /demo/config`).
+        capture_method:
+          type: string
+          enum: [automatic, manual]
+    DemoCheckoutResult:
+      type: object
+      required: [id, client_secret, amount, currency]
+      properties:
+        id:
+          type: string
+          description: Payment intent créé (`pi_…`).
+        client_secret:
+          type: string
+        amount:
+          type: integer
+        currency:
+          $ref: '#/components/schemas/Currency'
+      examples:
+        - { id: pi_17wFzIYrEHt5kAAwlSYtHy58, client_secret: pi_17wFzIYrEHt5kAAwlSYtHy58_secret_YWy1lwNDKLQ7u0ujL4rrAY9m, amount: 1250, currency: eur }
+    DemoSubscribe:
+      type: object
+      required: [email, payment_method]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        payment_method:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Moyen de paiement tokenisé dans le navigateur (`pm_…`), non encore rattaché.
+        priceId:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Facultatif ; doit être le prix d'abonnement du catalogue.
+    DemoSubscriptionSummary:
+      type: object
+      required: [id, status, current_period_start, current_period_end]
+      properties:
+        id:
+          type: string
+        status:
+          $ref: '#/components/schemas/SubscriptionStatus'
+        current_period_start:
+          $ref: '#/components/schemas/Timestamp'
+        current_period_end:
+          $ref: '#/components/schemas/Timestamp'
+    DemoInvoiceSummary:
+      type: object
+      required: [id, status, amount_due, amount_paid, currency]
+      properties:
+        id:
+          type: string
+        status:
+          $ref: '#/components/schemas/InvoiceStatus'
+        amount_due:
+          type: integer
+        amount_paid:
+          type: integer
+        currency:
+          $ref: '#/components/schemas/Currency'
+    DemoSubscribeResult:
+      type: object
+      required: [customer, subscription, invoice]
+      properties:
+        customer:
+          type: string
+          description: Client créé (`cus_…`).
+        subscription:
+          $ref: '#/components/schemas/DemoSubscriptionSummary'
+        invoice:
+          $ref: '#/components/schemas/DemoInvoiceSummary'
+      examples:
+        - { customer: cus_FgQyvDfnLomJKqfhvbSDReSd, subscription: { id: sub_ubgitcAa5OfvxeuN9ZIsOPX4, status: active, current_period_start: 1767229200, current_period_end: 1769907600 }, invoice: { id: in_n6Iw1SijgnR4BYg0f9tACA14, status: paid, amount_due: 990, amount_paid: 990, currency: eur } }
