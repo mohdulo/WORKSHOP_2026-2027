@@ -20,6 +20,27 @@ Production (un seul process qui sert aussi le front) :
 npm run build && npm start   # http://localhost:4000
 ```
 
+### Docker
+
+Prérequis : Docker avec Compose v2. Une seule image : l'API sert aussi le front buildé, comme `npm run build && npm start`.
+
+```bash
+docker compose up --build -d   # http://localhost:4000
+docker compose logs -f         # clés de test affichées au démarrage
+docker compose down            # ajouter -v pour effacer aussi la base
+```
+
+La base SQLite vit dans le volume `paysim-data` (`/data/paysim.db` dans le conteneur) : elle survit aux redémarrages et aux rebuilds. Pour changer le port exposé ou les clés, copier `.env.example` en `.env` (jamais commité). Sans `.env`, le conteneur utilise les clés de test ci-dessous, en mode développement.
+
+`NODE_ENV=production` dans `.env` exige une `VAULT_KEY` personnalisée (`openssl rand -hex 32`), désactive l'horloge de test et suppose un accès en HTTPS (reverse proxy TLS devant le conteneur).
+
+Sans Compose :
+
+```bash
+docker build -t paysim .
+docker run -d --name paysim -p 4000:4000 -v paysim-data:/data paysim
+```
+
 Clés de test par défaut (surchargées par variables d'environnement) :
 
 | Variable | Défaut |

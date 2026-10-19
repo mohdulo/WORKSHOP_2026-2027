@@ -1,0 +1,25 @@
+# PaySim en un conteneur : API + front buildé sur http://localhost:4000, base SQLite dans le volume `paysim-data`.
+#
+#   docker compose up --build -d      démarrer (ou reconstruire) l'image
+#   docker compose logs -f            voir les logs (clés de test affichées au démarrage)
+#   docker compose down               arrêter ; ajouter -v pour effacer aussi la base
+#
+# Variables optionnelles (port exposé, clés, NODE_ENV) : copier .env.example en .env.
+services:
+  paysim:
+    build: .
+    image: paysim:local
+    ports:
+      - "${PAYSIM_PORT:-4000}:4000"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - paysim-data:/data
+    init: true
+    restart: unless-stopped
+    # server.js attend la fin d'un envoi webhook en cours (≤ 10 s) avant de fermer la base.
+    stop_grace_period: 15s
+
+volumes:
+  paysim-data:

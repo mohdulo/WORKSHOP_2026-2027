@@ -1,0 +1,14 @@
+# Dépendances et artefacts : réinstallés / rebuildés dans l'image
+**/node_modules
+**/dist
+server/data
+
+# Secrets et fichiers locaux
+.env
+.env.*
+!.env.example
+
+# Documentation et outillage inutiles à l'image
+*.md
+.git
+.claude
